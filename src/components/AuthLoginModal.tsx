@@ -18,7 +18,7 @@ import {
 import { UserAccount, UserRole } from '../types';
 import { auth, googleAuthProvider, db } from '../firebase';
 import { signInWithPopup } from 'firebase/auth';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 
 interface AuthLoginModalProps {
   isOpen: boolean;
@@ -54,20 +54,27 @@ export const AuthLoginModal: React.FC<AuthLoginModalProps> = ({
       const cred = await signInWithPopup(auth, googleAuthProvider);
       const user = cred.user;
 
-      // Persist profile to Firestore
-      const userProfile = {
-        id: user.uid,
-        name: user.displayName || 'Google Resident',
-        email: user.email || '',
-        role: 'tenant',
-        photoURL: user.photoURL || '',
-        createdAt: new Date().toISOString(),
-      };
-
+      // Load the existing profile first. Only a brand-new account gets a profile written, and
+      // always as a tenant: an existing profile (and its role) must never be overwritten on login,
+      // otherwise a landlord who signs in with Google would be demoted to tenant every time.
+      const profileRef = doc(db, 'users', user.uid);
+      let role: UserRole = 'tenant';
       try {
-        await setDoc(doc(db, 'users', user.uid), userProfile, { merge: true });
+        const snap = await getDoc(profileRef);
+        if (snap.exists()) {
+          role = snap.data().role === 'landlord' ? 'landlord' : 'tenant';
+        } else {
+          await setDoc(profileRef, {
+            id: user.uid,
+            name: user.displayName || 'Google Resident',
+            email: user.email || '',
+            role: 'tenant',
+            photoURL: user.photoURL || '',
+            createdAt: new Date().toISOString(),
+          });
+        }
       } catch (dbErr) {
-        console.warn('Firestore profile save notice:', dbErr);
+        console.warn('Firestore profile sync notice:', dbErr);
       }
 
       const googleAccount: UserAccount = {
@@ -75,7 +82,7 @@ export const AuthLoginModal: React.FC<AuthLoginModalProps> = ({
         username: user.email?.split('@')[0] || 'google_user',
         name: user.displayName || 'Google Resident',
         nepaliName: 'गुगल प्रयोगकर्ता',
-        role: 'tenant',
+        role,
         unitId: 'unit-201',
         unitNumber: 'Flat 201',
         phone: user.phoneNumber || '+977 Google Auth',

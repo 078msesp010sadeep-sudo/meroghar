@@ -85,6 +85,7 @@ export function GeminiChatbotView() {
       try {
         await setDoc(doc(db, 'chat_messages', userMsg.id), {
           id: userMsg.id,
+          ownerId: auth.currentUser.uid,
           senderId: auth.currentUser.uid,
           senderName: auth.currentUser.displayName || 'Resident',
           role: 'user',
@@ -142,6 +143,7 @@ export function GeminiChatbotView() {
         try {
           await setDoc(doc(db, 'chat_messages', botMsg.id), {
             id: botMsg.id,
+            ownerId: auth.currentUser.uid,
             senderId: 'ai-gemini',
             senderName: 'Gemini AI Assistant',
             role: 'model',

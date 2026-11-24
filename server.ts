@@ -10,10 +10,62 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+// Trust the first proxy hop (Cloud Run / AI Studio) so req.ip is the real client.
+app.set('trust proxy', 1);
+
+// Audio uploads need a large body; every other route only carries small JSON.
+// This parser must be registered first so the small global limit does not reject audio.
+app.use('/api/transcribe', express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '200kb' }));
+
+// Minimal in-memory rate limiter for the AI-backed endpoints (per IP, per minute).
+// Replace with a shared store (e.g. Redis) if you run more than one instance.
+const RATE_LIMIT_PER_MINUTE = Number(process.env.API_RATE_LIMIT_PER_MINUTE) || 30;
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+app.use('/api', (req, res, next) => {
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
+    return next();
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_LIMIT_PER_MINUTE) {
+    res.setHeader('Retry-After', Math.ceil((bucket.resetAt - now) / 1000).toString());
+    return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+  }
+  return next();
+});
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.resetAt <= now) rateBuckets.delete(key);
+  }
+}, 5 * 60_000).unref();
+
+// Gemini model IDs. Verify against https://ai.google.dev/gemini-api/docs/models before changing.
+const MODEL_GENERAL = 'gemini-3.8-flash';
+const MODEL_PRO = 'gemini-3.1-pro-preview';
+const MODEL_FAST = 'gemini-3.1-flash-lite';
+const MODEL_TRANSCRIBE = 'gemini-3.5-transcribe';
+// Only these models may be requested by the browser. 'gemini-3.5-flash' is the label the UI
+// still uses; it is not a valid API model ID, so it is remapped to the general model.
+const CHAT_MODEL_ALLOWLIST: Record<string, string> = {
+  'gemini-3.8-flash': MODEL_GENERAL,
+  'gemini-3.5-flash': MODEL_GENERAL,
+  'gemini-3.1-pro-preview': MODEL_PRO,
+  'gemini-3.1-flash-lite': MODEL_FAST,
+};
+
+// Input size caps so a single request cannot burn the API budget.
+const MAX_PROMPT_CHARS = 4000;
+const MAX_CLAUSE_CHARS = 8000;
+const MAX_CHAT_MESSAGES = 40;
+const MAX_CHAT_MESSAGE_CHARS = 8000;
+const MAX_RECIPE_ITEMS = 200;
 
 // Initialize Gemini Client
 const apiKey = process.env.GEMINI_API_KEY;
@@ -35,10 +87,10 @@ if (apiKey) {
 
 // Legal Counselor System Instruction
 const LEGAL_COUNSEL_INSTRUCTION = `
-You are the KinHome Certified Tenancy & Residential Housing Legal Advisor.
-You advise landlords (houseowners) and renting families on residential tenancy statutes, mutual rights, utility sub-metering laws (water, electricity, waste collection), warranty of habitability, repairs, security deposit regulations, fair housing laws, and dispute mediation.
+You are the KinHome Tenancy & Residential Housing Information Assistant for Nepal.
+You help landlords (houseowners) and renting families understand residential tenancy rules, mutual rights, utility sub-metering (water, electricity, waste collection), habitability, repairs, security deposits, and dispute mediation.
 
-Provide balanced, objective, highly practical guidance. Clarify that while your advice is grounded in residential housing codes (e.g. Civil Code, Uniform Residential Landlord and Tenant Act, municipal sanitation bylaws), urgent disputes should be corroborated with local jurisdiction housing authorities or a qualified attorney.
+Ground your guidance in Nepali law and practice (e.g. the Muluki Civil Code 2074 and municipal / ward-level rules). Do not cite laws from other countries as if they apply in Nepal. If you are not certain of a specific section number or notice period, say so instead of guessing. Provide balanced, practical guidance, and make clear this is general information, not legal advice: urgent or high-value disputes should be checked with the local ward office or a qualified Nepali advocate.
 
 Structure your response with:
 1. Executive Summary & Statutory Principles
@@ -51,15 +103,20 @@ Structure your response with:
 app.post('/api/legal/consult', async (req, res) => {
   try {
     const { prompt, userRole, unitContext } = req.body;
-    if (!prompt) {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'Prompt is required' });
     }
+    if (prompt.length > MAX_PROMPT_CHARS) {
+      return res.status(413).json({ error: `Prompt must be ${MAX_PROMPT_CHARS} characters or fewer` });
+    }
+    const safeRole = userRole === 'landlord' ? 'landlord' : 'tenant';
+    const safeUnitContext = typeof unitContext === 'string' ? unitContext.slice(0, 500) : '';
 
     if (aiClient) {
-      const systemMessage = `${LEGAL_COUNSEL_INSTRUCTION}\nContext: The querying user is a ${userRole || 'tenant'}. ${unitContext ? `Property Context: ${unitContext}` : ''}`;
-      
+      const systemMessage = `${LEGAL_COUNSEL_INSTRUCTION}\nContext: The querying user is a ${safeRole}. ${safeUnitContext ? `Property Context: ${safeUnitContext}` : ''}`;
+
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: MODEL_GENERAL,
         contents: prompt,
         config: {
           systemInstruction: systemMessage,
@@ -76,7 +133,7 @@ app.post('/api/legal/consult', async (req, res) => {
     }
 
     // Comprehensive expert fallback when GEMINI_API_KEY is not configured
-    const fallbackAnswer = generateFallbackLegalAdvice(prompt, userRole);
+    const fallbackAnswer = generateFallbackLegalAdvice(prompt, safeRole);
     return res.json({
       success: true,
       answer: fallbackAnswer,
@@ -84,13 +141,14 @@ app.post('/api/legal/consult', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/legal/consult:', error);
-    // Provide graceful legal resolution
-    const fallback = generateFallbackLegalAdvice(req.body.prompt || '', req.body.userRole || 'tenant');
+    // Provide graceful legal resolution (do not leak upstream error text to the browser)
+    const rawPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt : '';
+    const fallback = generateFallbackLegalAdvice(rawPrompt, req.body?.userRole === 'landlord' ? 'landlord' : 'tenant');
     return res.json({
       success: true,
       answer: fallback,
       source: 'expert_fallback',
-      warning: error?.message || 'Consultation processed with tenancy knowledge base.',
+      warning: 'Live AI consultation was unavailable; showing the built-in tenancy knowledge base.',
     });
   }
 });
@@ -99,8 +157,11 @@ app.post('/api/legal/consult', async (req, res) => {
 app.post('/api/legal/analyze-clause', async (req, res) => {
   try {
     const { clauseText } = req.body;
-    if (!clauseText) {
+    if (typeof clauseText !== 'string' || !clauseText.trim()) {
       return res.status(400).json({ error: 'Clause text is required' });
+    }
+    if (clauseText.length > MAX_CLAUSE_CHARS) {
+      return res.status(413).json({ error: `Clause text must be ${MAX_CLAUSE_CHARS} characters or fewer` });
     }
 
     if (aiClient) {
@@ -110,10 +171,10 @@ app.post('/api/legal/analyze-clause', async (req, res) => {
 3. Recommended Neutral Revision that protects both houseowner and renting family.`;
 
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: MODEL_GENERAL,
         contents: prompt,
         config: {
-          systemInstruction: 'You are an expert residential lease contract auditor and tenancy rights attorney.',
+          systemInstruction: 'You are a residential lease contract reviewer for Nepal. Cite only laws you are confident apply in Nepal, and say when you are unsure. This is general information, not legal advice.',
           temperature: 0.2,
         },
       });
@@ -144,7 +205,14 @@ Residential tenancy laws strictly regulate utility pass-throughs, entry notices,
 // 3. AI Nepali Kitchen Recipe Recommendation Endpoint
 app.post('/api/recipes/recommend', async (req, res) => {
   try {
-    const { availableItems = [], mealType = 'all', dietaryPreference = 'all', servings = 4 } = req.body;
+    const body = req.body ?? {};
+    // Never trust the shape of client input: a non-array here used to crash the whole server.
+    const availableItems: any[] = (Array.isArray(body.availableItems) ? body.availableItems : [])
+      .filter((i: any) => i && typeof i === 'object')
+      .slice(0, MAX_RECIPE_ITEMS);
+    const mealType = typeof body.mealType === 'string' ? body.mealType.slice(0, 40) : 'all';
+    const dietaryPreference = typeof body.dietaryPreference === 'string' ? body.dietaryPreference.slice(0, 80) : 'all';
+    const servings = Math.min(Math.max(Number(body.servings) || 4, 1), 20);
 
     const itemsSummary = availableItems
       .map((item: any) => `${item.name} (${item.nepaliName || ''}) [ID: ${item.id}]`)
@@ -191,7 +259,7 @@ Your expertise is authentic, traditional, and everyday Nepali home cooking (द�
 Strict rule: Output ONLY pure, valid JSON with a "recipes" key. Do not output markdown code blocks or explanations outside JSON.`;
 
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: MODEL_GENERAL,
         contents: prompt,
         config: {
           systemInstruction: systemMessage,
@@ -224,12 +292,12 @@ Strict rule: Output ONLY pure, valid JSON with a "recipes" key. Do not output ma
     });
   } catch (error: any) {
     console.error('Error in /api/recipes/recommend:', error);
-    const fallback = generateFallbackRecipes(req.body.availableItems || [], req.body.mealType || 'all');
+    // Use known-safe arguments: the original request body may be what caused the error.
     return res.json({
       success: true,
-      recipes: fallback,
+      recipes: generateFallbackRecipes([], 'all'),
       source: 'culinary_fallback',
-      warning: error?.message,
+      warning: 'Live AI recipes were unavailable; showing the built-in Nepali recipe collection.',
     });
   }
 });
@@ -398,7 +466,7 @@ function generateFallbackRecipes(availableItems: any[], mealType: string): any[]
     {
       id: 'rec-kwati-soup',
       title: 'Sprouted 9-Bean Kwati Soup with Jimbu & Ajwain',
-      nepaliName: '९ थरी गेडागुडी क्वाँटीको तातो पौष्टिक झोल',
+      nepaliTitle: '९ थरी गेडागुडी क्वाँटीको तातो पौष्टिक झोल',
       tagline: 'Rich, warming festive soup packed with sprouted protein, tempered with fragrant jimbu, ginger, and wild mountain spices.',
       mealCategory: 'winter_jhol',
       prepTime: '20 mins',
@@ -446,8 +514,17 @@ function generateFallbackRecipes(availableItems: any[], mealType: string): any[]
 }
 
 
-// Helper for fallback legal advice
+// Offline legal answers. TODO: the section numbers and notice periods inside the raw text below
+// come from US (California-style) tenancy law, not Nepali law. Have them rewritten and reviewed
+// by a Nepali advocate; until then every offline answer carries this disclaimer.
+const OFFLINE_LEGAL_DISCLAIMER =
+  '> **Note:** This offline summary uses general tenancy principles and references laws that are not specific to Nepal. Statute numbers and notice periods may not apply to your tenancy. Please confirm with your ward office or a qualified Nepali advocate before acting.\n\n';
+
 function generateFallbackLegalAdvice(prompt: string, role: string): string {
+  return OFFLINE_LEGAL_DISCLAIMER + generateFallbackLegalAdviceRaw(prompt, role);
+}
+
+function generateFallbackLegalAdviceRaw(prompt: string, role: string): string {
   const p = prompt.toLowerCase();
   
   if (p.includes('enter') || p.includes('notice of entry') || p.includes('inspect')) {
@@ -529,10 +606,13 @@ Submit formal requests through the KinHome Maintenance Bridge and preserve all e
 // 4. Audio Transcription Endpoint (using gemini-3.5-transcribe)
 app.post('/api/transcribe', async (req, res) => {
   try {
-    const { audioBase64, mimeType = 'audio/webm' } = req.body;
-    if (!audioBase64) {
+    const { audioBase64 } = req.body;
+    if (typeof audioBase64 !== 'string' || !audioBase64) {
       return res.status(400).json({ error: 'Audio data is required' });
     }
+    const requestedMime = typeof req.body.mimeType === 'string' ? req.body.mimeType.split(';')[0].trim() : '';
+    const ALLOWED_AUDIO_MIME = ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/aac', 'audio/flac'];
+    const mimeType = ALLOWED_AUDIO_MIME.includes(requestedMime) ? requestedMime : 'audio/webm';
 
     if (aiClient) {
       const audioPart = {
@@ -543,7 +623,7 @@ app.post('/api/transcribe', async (req, res) => {
       };
 
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.5-transcribe',
+        model: MODEL_TRANSCRIBE,
         contents: {
           parts: [
             audioPart,
@@ -558,7 +638,7 @@ app.post('/api/transcribe', async (req, res) => {
       return res.json({
         success: true,
         transcription: transcribedText.trim(),
-        modelUsed: 'gemini-3.5-transcribe',
+        modelUsed: MODEL_TRANSCRIBE,
       });
     }
 
@@ -570,10 +650,7 @@ app.post('/api/transcribe', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/transcribe:', error);
-    return res.status(500).json({
-      error: 'Failed to transcribe audio',
-      details: error?.message || String(error),
-    });
+    return res.status(500).json({ error: 'Failed to transcribe audio' });
   }
 });
 
@@ -581,16 +658,22 @@ app.post('/api/transcribe', async (req, res) => {
 app.post('/api/maps/grounding', async (req, res) => {
   try {
     const { query, userLocation } = req.body;
-    if (!query) {
+    if (typeof query !== 'string' || !query.trim()) {
       return res.status(400).json({ error: 'Query is required' });
     }
+    if (query.length > MAX_PROMPT_CHARS) {
+      return res.status(413).json({ error: `Query must be ${MAX_PROMPT_CHARS} characters or fewer` });
+    }
 
-    const lat = userLocation?.latitude || 27.7172; // Default Kathmandu Center
-    const lng = userLocation?.longitude || 85.3240;
+    const rawLat = Number(userLocation?.latitude);
+    const rawLng = Number(userLocation?.longitude);
+    const validCoords = Number.isFinite(rawLat) && Number.isFinite(rawLng) && Math.abs(rawLat) <= 90 && Math.abs(rawLng) <= 180;
+    const lat = validCoords ? rawLat : 27.7172; // Default Kathmandu Center
+    const lng = validCoords ? rawLng : 85.3240;
 
     if (aiClient) {
       const response = await aiClient.models.generateContent({
-        model: 'gemini-3.5-flash',
+        model: MODEL_GENERAL,
         contents: query,
         config: {
           tools: [{ googleMaps: {} }],
@@ -631,7 +714,7 @@ app.post('/api/maps/grounding', async (req, res) => {
         text,
         mapLinks,
         groundingChunks,
-        modelUsed: 'gemini-3.5-flash',
+        modelUsed: MODEL_GENERAL,
       });
     }
 
@@ -676,10 +759,7 @@ app.post('/api/maps/grounding', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/maps/grounding:', error);
-    return res.status(500).json({
-      error: 'Failed to query Maps Grounding',
-      details: error?.message || String(error),
-    });
+    return res.status(500).json({ error: 'Failed to query Maps Grounding' });
   }
 });
 
@@ -687,13 +767,24 @@ app.post('/api/maps/grounding', async (req, res) => {
 app.post('/api/chat', async (req, res) => {
   try {
     const {
-      messages = [],
+      messages: rawMessages = [],
       systemRole = 'general_advisor',
       modelChoice,
       taskComplexity = 'general',
     } = req.body;
 
-    if (!Array.isArray(messages) || messages.length === 0) {
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+      return res.status(400).json({ error: 'Messages array is required' });
+    }
+    // Keep only the most recent turns and clamp each message so history cannot balloon the bill.
+    const messages = rawMessages
+      .filter((m: any) => m && typeof m === 'object')
+      .slice(-MAX_CHAT_MESSAGES)
+      .map((m: any) => ({
+        role: m.role,
+        text: String(m.text ?? m.content ?? '').slice(0, MAX_CHAT_MESSAGE_CHARS),
+      }));
+    if (messages.length === 0) {
       return res.status(400).json({ error: 'Messages array is required' });
     }
 
@@ -705,26 +796,26 @@ app.post('/api/chat', async (req, res) => {
       water_science_expert: `You are the KinHome Residential Water Quality & Environmental Scientist. You analyze drinking water chemistry (pH, TDS, turbidity, free chlorine, hardness, arsenic, iron) for Kathmandu homes and advise on WHO / Nepal NDWQS standards and purification methods (chlorination, boiling, RO, sand filters).`,
     };
 
-    const instruction = systemInstructions[systemRole] || systemInstructions.general_advisor;
+    const instruction = Object.prototype.hasOwnProperty.call(systemInstructions, systemRole)
+      ? systemInstructions[systemRole]
+      : systemInstructions.general_advisor;
 
-    // Model selection based on user requirements:
-    // gemini-3.1-pro-preview for complex tasks
-    // gemini-3.5-flash for general tasks
-    // gemini-3.1-flash-lite for fast tasks
-    let targetModel = 'gemini-3.5-flash';
+    // Model selection (browser can only pick from CHAT_MODEL_ALLOWLIST):
+    // pro for complex tasks, general for normal tasks, flash-lite for fast tasks
+    let targetModel = MODEL_GENERAL;
     if (modelChoice === 'gemini-3.1-pro-preview' || taskComplexity === 'complex') {
-      targetModel = 'gemini-3.1-pro-preview';
+      targetModel = MODEL_PRO;
     } else if (modelChoice === 'gemini-3.1-flash-lite' || taskComplexity === 'fast') {
-      targetModel = 'gemini-3.1-flash-lite';
-    } else if (modelChoice) {
-      targetModel = modelChoice;
+      targetModel = MODEL_FAST;
+    } else if (typeof modelChoice === 'string' && CHAT_MODEL_ALLOWLIST[modelChoice]) {
+      targetModel = CHAT_MODEL_ALLOWLIST[modelChoice];
     }
 
     if (aiClient) {
       // Map message history to Gemini API format
       const contents = messages.map((m: any) => ({
         role: m.role === 'model' || m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.text || m.content || '' }],
+        parts: [{ text: m.text }],
       }));
 
       try {
@@ -744,11 +835,11 @@ app.post('/api/chat', async (req, res) => {
           modelUsed: targetModel,
         });
       } catch (modelErr: any) {
-        console.warn(`Error generating with ${targetModel}, attempting gemini-3.5-flash fallback:`, modelErr);
-        // Fallback to gemini-3.5-flash if pro-preview requires paid key
-        if (targetModel !== 'gemini-3.5-flash') {
+        console.warn(`Error generating with ${targetModel}, attempting ${MODEL_GENERAL} fallback:`, modelErr);
+        // Fall back to the general model if pro-preview requires a paid key
+        if (targetModel !== MODEL_GENERAL) {
           const fallbackResponse = await aiClient.models.generateContent({
-            model: 'gemini-3.5-flash',
+            model: MODEL_GENERAL,
             contents,
             config: {
               systemInstruction: instruction,
@@ -758,8 +849,8 @@ app.post('/api/chat', async (req, res) => {
           return res.json({
             success: true,
             reply: fallbackResponse.text || '',
-            modelUsed: 'gemini-3.5-flash',
-            note: 'Model gracefully served via gemini-3.5-flash.',
+            modelUsed: MODEL_GENERAL,
+            note: `Model gracefully served via ${MODEL_GENERAL}.`,
           });
         }
         throw modelErr;
@@ -780,10 +871,7 @@ app.post('/api/chat', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/chat:', error);
-    return res.status(500).json({
-      error: 'Failed to process chat message',
-      details: error?.message || String(error),
-    });
+    return res.status(500).json({ error: 'Failed to process chat message' });
   }
 });
 
@@ -874,7 +962,7 @@ app.post('/api/science/pubchem', async (req, res) => {
       },
     };
 
-    const targetKey = (compoundName || '').toLowerCase().trim();
+    const targetKey = (typeof compoundName === 'string' ? compoundName : '').toLowerCase().trim().slice(0, 100);
     if (KATHMANDU_WATER_CHEMICALS[targetKey]) {
       const data = KATHMANDU_WATER_CHEMICALS[targetKey];
       return res.json({
@@ -924,8 +1012,28 @@ app.post('/api/science/pubchem', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/science/pubchem:', error);
-    return res.status(500).json({ error: 'Failed to query PubChem data', details: error?.message });
+    return res.status(500).json({ error: 'Failed to query PubChem data' });
   }
+});
+
+// Unknown /api routes get JSON, not the SPA HTML page.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Last-resort error handler: malformed JSON, oversized bodies, anything a route forgot to catch.
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(err);
+  const status = err?.status === 400 || err?.type === 'entity.parse.failed' ? 400 : err?.status === 413 ? 413 : 500;
+  if (status === 500) console.error('Unhandled server error:', err);
+  res.status(status).json({
+    error: status === 400 ? 'Invalid request body' : status === 413 ? 'Request body too large' : 'Internal server error',
+  });
+});
+
+// A single bad request must never take the whole server down.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
 });
 
 // Development or Production Vite serving
