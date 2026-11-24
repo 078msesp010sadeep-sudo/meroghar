@@ -2,7 +2,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
     function isSignedIn() {
       return request.auth != null;
     }
@@ -23,93 +25,163 @@ service cloud.firestore {
       return resource.data;
     }
 
-    // Default deny catch-all
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function hasProfile() {
+      return isSignedIn() && exists(profilePath());
+    }
+
+    // Roles are stored on the user's profile document. A client can never grant itself
+    // 'landlord': see the users rules below. The first landlord must be set in the
+    // Firebase console (or with the Admin SDK).
+    function isLandlord() {
+      return hasProfile() && get(profilePath()).data.get('role', 'tenant') == 'landlord';
+    }
+
+    function myUnitId() {
+      return hasProfile() ? get(profilePath()).data.get('unitId', '') : '';
+    }
+
+    // Default deny: anything not matched below is rejected.
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Users collection: private profile per user
+    // ---------------------------------------------------------------
+    // users: one private profile per account
+    // ---------------------------------------------------------------
     match /users/{userId} {
-      allow read: if isSignedIn() && (request.auth.uid == userId || resource.data.id == request.auth.uid);
+      allow read: if isOwner(userId) || isLandlord();
+
+      // Self sign-up may only create a tenant profile with a fixed set of fields.
+      // role / unitId are assigned by a landlord, never self-declared.
       allow create: if isOwner(userId)
                     && isValidId(userId)
+                    && incoming().keys().hasOnly(['id', 'name', 'email', 'role', 'photoURL', 'createdAt', 'phone'])
                     && incoming().id == userId
                     && incoming().email is string
                     && incoming().name is string
-                    && incoming().name.size() <= 100;
-      allow update: if isOwner(userId)
-                    && incoming().id == existing().id
-                    && incoming().email == existing().email;
+                    && incoming().name.size() <= 100
+                    && incoming().get('role', 'tenant') == 'tenant';
+
+      // The owner can edit their own profile but not their identity, role or unit.
+      allow update: if (
+                      isOwner(userId)
+                      && incoming().id == existing().id
+                      && incoming().email == existing().email
+                      && incoming().get('role', 'tenant') == existing().get('role', 'tenant')
+                      && incoming().get('unitId', '') == existing().get('unitId', '')
+                    )
+                    || (
+                      // A landlord may assign role / unit to a resident, but not change identity.
+                      isLandlord()
+                      && incoming().id == existing().id
+                      && incoming().email == existing().email
+                    );
       allow delete: if false;
     }
 
-    // Property units: readable by authenticated residents
+    // ---------------------------------------------------------------
+    // units: landlord manages; a tenant sees only their own unit
+    // ---------------------------------------------------------------
     match /units/{unitId} {
-      allow read: if isSignedIn();
-      allow create, update: if isSignedIn()
+      allow read: if isLandlord() || (hasProfile() && myUnitId() == unitId);
+      allow create, update: if isLandlord()
                             && isValidId(unitId)
                             && incoming().id == unitId
                             && incoming().unitNumber is string;
       allow delete: if false;
     }
 
-    // Invoices: read by authenticated residents, create/update with valid schema
+    // ---------------------------------------------------------------
+    // invoices: landlord issues and settles; a tenant sees their unit's
+    // invoices and may only submit payment details for them.
+    // Marking an invoice 'paid' is a landlord action (or a trusted
+    // server-side payment webhook using the Admin SDK).
+    // ---------------------------------------------------------------
     match /invoices/{invoiceId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn()
+      allow read: if isLandlord() || (hasProfile() && existing().unitId == myUnitId());
+      allow create: if isLandlord()
                     && isValidId(invoiceId)
                     && incoming().id == invoiceId
                     && incoming().unitId is string
-                    && incoming().totalDue is number;
-      allow update: if isSignedIn()
-                    && incoming().id == existing().id
-                    && (
-                      // Payment settlement action
-                      incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentMethod', 'paymentReference', 'paidDate', 'updatedAt'])
-                      ||
-                      // Landlord revision
-                      (incoming().totalDue is number && incoming().unitId == existing().unitId)
+                    && incoming().totalDue is number
+                    && incoming().totalDue >= 0;
+      allow update: if (
+                      isLandlord()
+                      && incoming().id == existing().id
+                      && incoming().unitId == existing().unitId
+                      && incoming().totalDue is number
+                      && incoming().totalDue >= 0
+                    )
+                    || (
+                      hasProfile()
+                      && existing().unitId == myUnitId()
+                      && incoming().diff(existing()).affectedKeys().hasOnly(['paymentMethod', 'paymentReference', 'updatedAt'])
                     );
       allow delete: if false;
     }
 
-    // Maintenance Tickets: residents can read & create tickets, update status
+    // ---------------------------------------------------------------
+    // maintenance_tickets: tenants raise tickets for their own unit;
+    // landlord triages them.
+    // ---------------------------------------------------------------
     match /maintenance_tickets/{ticketId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn()
+      allow read: if isLandlord() || (hasProfile() && existing().unitId == myUnitId());
+      allow create: if hasProfile()
                     && isValidId(ticketId)
                     && incoming().id == ticketId
                     && incoming().title is string
-                    && incoming().title.size() <= 200;
-      allow update: if isSignedIn()
-                    && incoming().id == existing().id
-                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'priority', 'notes', 'assignedTo', 'resolvedAt', 'updatedAt']);
+                    && incoming().title.size() <= 200
+                    && (isLandlord() || incoming().unitId == myUnitId());
+      allow update: if (
+                      isLandlord()
+                      && incoming().id == existing().id
+                      && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'priority', 'notes', 'assignedTo', 'resolvedAt', 'updatedAt'])
+                    )
+                    || (
+                      hasProfile()
+                      && existing().unitId == myUnitId()
+                      && incoming().id == existing().id
+                      && incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt'])
+                    );
       allow delete: if false;
     }
 
-    // Building Notices: readable by all signed in users, created/updated by signed in
+    // ---------------------------------------------------------------
+    // notices: everyone signed in reads; only the landlord posts
+    // ---------------------------------------------------------------
     match /notices/{noticeId} {
       allow read: if isSignedIn();
-      allow create, update: if isSignedIn()
+      allow create, update: if isLandlord()
                             && isValidId(noticeId)
                             && incoming().title is string
                             && incoming().title.size() <= 200;
       allow delete: if false;
     }
 
-    // Chat messages: multi-turn conversation persistence
+    // ---------------------------------------------------------------
+    // chat_messages: AI chat history is private to the user who wrote it.
+    // The client must send ownerId == its own uid on every message
+    // (including the AI replies it stores for that user).
+    // ---------------------------------------------------------------
     match /chat_messages/{messageId} {
-      allow read: if isSignedIn();
+      allow read: if isSignedIn() && (existing().get('ownerId', '') == request.auth.uid || isLandlord());
       allow create: if isSignedIn()
                     && isValidId(messageId)
                     && incoming().id == messageId
-                    && incoming().role in ['user', 'model', 'system']
+                    && incoming().ownerId == request.auth.uid
+                    && incoming().role in ['user', 'model']
                     && incoming().text is string
                     && incoming().text.size() <= 8000;
       allow update, delete: if false;
     }
 
-    // Water Quality Lab Tests: drinking water chemistry tests
+    // ---------------------------------------------------------------
+    // water_quality_tests: append-only lab log with sane value ranges
+    // ---------------------------------------------------------------
     match /water_quality_tests/{testId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
@@ -117,9 +189,10 @@ service cloud.firestore {
                     && incoming().id == testId
                     && incoming().waterSource in ['kukl_pipeline', 'groundwater_boring', 'tanker_delivery', 'ro_purified']
                     && incoming().phLevel is number
-                    && incoming().tdsPpm is number;
-      allow update: if isSignedIn() && incoming().id == existing().id;
-      allow delete: if false;
+                    && incoming().phLevel >= 0 && incoming().phLevel <= 14
+                    && incoming().tdsPpm is number
+                    && incoming().tdsPpm >= 0 && incoming().tdsPpm <= 10000;
+      allow update, delete: if false;
     }
   }
 }
