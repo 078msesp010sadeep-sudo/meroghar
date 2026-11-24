@@ -1,0 +1,125 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Users collection: private profile per user
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || resource.data.id == request.auth.uid);
+      allow create: if isOwner(userId)
+                    && isValidId(userId)
+                    && incoming().id == userId
+                    && incoming().email is string
+                    && incoming().name is string
+                    && incoming().name.size() <= 100;
+      allow update: if isOwner(userId)
+                    && incoming().id == existing().id
+                    && incoming().email == existing().email;
+      allow delete: if false;
+    }
+
+    // Property units: readable by authenticated residents
+    match /units/{unitId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn()
+                            && isValidId(unitId)
+                            && incoming().id == unitId
+                            && incoming().unitNumber is string;
+      allow delete: if false;
+    }
+
+    // Invoices: read by authenticated residents, create/update with valid schema
+    match /invoices/{invoiceId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && isValidId(invoiceId)
+                    && incoming().id == invoiceId
+                    && incoming().unitId is string
+                    && incoming().totalDue is number;
+      allow update: if isSignedIn()
+                    && incoming().id == existing().id
+                    && (
+                      // Payment settlement action
+                      incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentMethod', 'paymentReference', 'paidDate', 'updatedAt'])
+                      ||
+                      // Landlord revision
+                      (incoming().totalDue is number && incoming().unitId == existing().unitId)
+                    );
+      allow delete: if false;
+    }
+
+    // Maintenance Tickets: residents can read & create tickets, update status
+    match /maintenance_tickets/{ticketId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && isValidId(ticketId)
+                    && incoming().id == ticketId
+                    && incoming().title is string
+                    && incoming().title.size() <= 200;
+      allow update: if isSignedIn()
+                    && incoming().id == existing().id
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'priority', 'notes', 'assignedTo', 'resolvedAt', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Building Notices: readable by all signed in users, created/updated by signed in
+    match /notices/{noticeId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn()
+                            && isValidId(noticeId)
+                            && incoming().title is string
+                            && incoming().title.size() <= 200;
+      allow delete: if false;
+    }
+
+    // Chat messages: multi-turn conversation persistence
+    match /chat_messages/{messageId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && isValidId(messageId)
+                    && incoming().id == messageId
+                    && incoming().role in ['user', 'model', 'system']
+                    && incoming().text is string
+                    && incoming().text.size() <= 8000;
+      allow update, delete: if false;
+    }
+
+    // Water Quality Lab Tests: drinking water chemistry tests
+    match /water_quality_tests/{testId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && isValidId(testId)
+                    && incoming().id == testId
+                    && incoming().waterSource in ['kukl_pipeline', 'groundwater_boring', 'tanker_delivery', 'ro_purified']
+                    && incoming().phLevel is number
+                    && incoming().tdsPpm is number;
+      allow update: if isSignedIn() && incoming().id == existing().id;
+      allow delete: if false;
+    }
+  }
+}

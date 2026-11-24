@@ -1,0 +1,146 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Resident or houseowner user account details",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["landlord", "tenant"] },
+        "unitId": { "type": "string", "maxLength": 64 },
+        "unitNumber": { "type": "string", "maxLength": 32 },
+        "phone": { "type": "string", "maxLength": 24 },
+        "createdAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "name", "email", "role"]
+    },
+    "PropertyUnit": {
+      "title": "Property Unit",
+      "description": "Apartment unit in the residential building",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "unitNumber": { "type": "string", "maxLength": 32 },
+        "floor": { "type": "number" },
+        "tenantFamilyName": { "type": "string", "maxLength": 100 },
+        "monthlyRentNPR": { "type": "number" },
+        "status": { "type": "string", "enum": ["occupied", "vacant", "notice_served"] }
+      },
+      "required": ["id", "unitNumber", "monthlyRentNPR", "status"]
+    },
+    "Invoice": {
+      "title": "Consolidated Invoice",
+      "description": "Monthly consolidated utility and rent invoice",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "unitId": { "type": "string", "maxLength": 64 },
+        "billingMonth": { "type": "string", "maxLength": 30 },
+        "totalDue": { "type": "number" },
+        "status": { "type": "string", "enum": ["paid", "unpaid", "overdue"] },
+        "paymentMethod": { "type": "string", "maxLength": 40 },
+        "paymentReference": { "type": "string", "maxLength": 100 },
+        "paidDate": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "unitId", "billingMonth", "totalDue", "status"]
+    },
+    "MaintenanceTicket": {
+      "title": "Maintenance Ticket",
+      "description": "Plumbing, electrical, or structural repair ticket",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "unitId": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 150 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "category": { "type": "string", "enum": ["water", "electric", "structural", "sanitation", "general"] },
+        "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
+        "status": { "type": "string", "enum": ["reported", "in_progress", "resolved"] },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "unitId", "title", "category", "priority", "status"]
+    },
+    "BuildingNotice": {
+      "title": "Building Notice",
+      "description": "Notice for residents from houseowner",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 150 },
+        "content": { "type": "string", "maxLength": 3000 },
+        "category": { "type": "string", "maxLength": 40 },
+        "publishDate": { "type": "string", "maxLength": 30 },
+        "author": { "type": "string", "maxLength": 100 },
+        "isUrgent": { "type": "boolean" }
+      },
+      "required": ["id", "title", "content", "category"]
+    },
+    "ChatMessage": {
+      "title": "Chat Message",
+      "description": "Multi-turn assistant or community communication message",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "senderId": { "type": "string", "maxLength": 128 },
+        "senderName": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["user", "model", "system"] },
+        "text": { "type": "string", "maxLength": 5000 },
+        "modelUsed": { "type": "string", "maxLength": 60 },
+        "timestamp": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "role", "text"]
+    },
+    "WaterQualityTest": {
+      "title": "Water Quality Science Test",
+      "description": "Scientific water chemistry sample testing record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "unitId": { "type": "string", "maxLength": 64 },
+        "testedBy": { "type": "string", "maxLength": 100 },
+        "waterSource": { "type": "string", "enum": ["kukl_pipeline", "groundwater_boring", "tanker_delivery", "ro_purified"] },
+        "phLevel": { "type": "number" },
+        "tdsPpm": { "type": "number" },
+        "turbidityNtu": { "type": "number" },
+        "residualChlorineMgL": { "type": "number" },
+        "status": { "type": "string", "enum": ["safe", "caution", "hazardous"] },
+        "treatmentAdvised": { "type": "string", "maxLength": 1000 },
+        "testDate": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "waterSource", "phLevel", "tdsPpm", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile collection isolated per authenticated user ID"
+    },
+    "/units/{unitId}": {
+      "schema": "PropertyUnit",
+      "description": "Property units catalog"
+    },
+    "/invoices/{invoiceId}": {
+      "schema": "Invoice",
+      "description": "Monthly consolidated utility and rental invoices"
+    },
+    "/maintenance_tickets/{ticketId}": {
+      "schema": "MaintenanceTicket",
+      "description": "Building repair and maintenance tickets"
+    },
+    "/notices/{noticeId}": {
+      "schema": "BuildingNotice",
+      "description": "Official residency notices and announcements"
+    },
+    "/chat_messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Multi-turn assistant and community chat history"
+    },
+    "/water_quality_tests/{testId}": {
+      "schema": "WaterQualityTest",
+      "description": "Drinking water science and chemical analysis tests"
+    }
+  }
+}
